@@ -1,0 +1,44 @@
+name: ESX price post
+
+on:
+  schedule:
+    # 12:15 UTC = 3:15 PM Addis Ababa (EAT), just after ESX's 3:00 PM close, Monday-Friday.
+    # GitHub may start scheduled runs a few minutes late; that's normal.
+    - cron: "15 12 * * 1-5"
+  workflow_dispatch: # adds a "Run workflow" button so you can test or post on demand
+
+permissions:
+  contents: write # lets the job save the template rotation + price history back to the repo
+
+concurrency: esx-post
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Fetch prices and post to Telegram
+        env:
+          # >>> The bot token is added HERE, via the repo's Secrets (never in this file). <<<
+          # Settings -> Secrets and variables -> Actions -> New repository secret
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python esx_bot.py --send --csv data/prices.csv
+
+      # Committing each run keeps the template rotation going between runs, builds your
+      # price history, and counts as repo activity (GitHub pauses schedules after 60 idle days).
+      - name: Save rotation state and price history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .esx_post_state.json data/prices.csv
+          git diff --cached --quiet || git commit -m "ESX snapshot $(date -u +%F)"
+          git push
