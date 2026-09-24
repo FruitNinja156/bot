@@ -2,9 +2,11 @@ name: ESX price post
 
 on:
   schedule:
-    # 12:15 UTC = 3:15 PM Addis Ababa (EAT), just after ESX's 3:00 PM close, Monday-Friday.
-    # GitHub may start scheduled runs a few minutes late; that's normal.
-    - cron: "15 12 * * 1-5"
+    # Times are UTC. Ethiopia (EAT) is always UTC+3, with no daylight saving, so subtract 3 hours.
+    # GitHub often starts scheduled runs 10-30 minutes late; that's normal.
+    # ESX day (EAT): pre-open 9:00-9:30, trading 9:30-3:00 PM, closing session 3:00 PM.
+    - cron: "45 6 * * 1-5"   # 9:45 AM EAT, Mon-Fri: opening prices, after the pre-open auction
+    - cron: "45 12 * * 1-5"  # 3:45 PM EAT, Mon-Fri: final closing prices
   workflow_dispatch: # adds a "Run workflow" button so you can test or post on demand
 
 permissions:
@@ -25,20 +27,28 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Fetch prices and post to Telegram
+      - name: Fetch prices and post
         env:
-          # >>> The bot token is added HERE, via the repo's Secrets (never in this file). <<<
+          # >>> API keys are added HERE, via the repo's Secrets (never in this file). <<<
           # Settings -> Secrets and variables -> Actions -> New repository secret
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python esx_bot.py --send --csv data/prices.csv
+          LINKEDIN_ACCESS_TOKEN: ${{ secrets.LINKEDIN_ACCESS_TOKEN }} # expires every 60 days
+          LINKEDIN_AUTHOR_URN: ${{ secrets.LINKEDIN_AUTHOR_URN }}     # optional, leave unset
+          X_API_KEY: ${{ secrets.X_API_KEY }}                         # X (Twitter): all four
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}                   # come from the X Developer
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}               # Console. Each post costs
+          X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }} # ~$0.015 in X credits.
+        # "all" = every platform whose secrets are set. Remove a platform's secrets to stop posting there.
+        run: python esx_bot.py --send all --csv data/prices.csv
 
       # Committing each run keeps the template rotation going between runs, builds your
       # price history, and counts as repo activity (GitHub pauses schedules after 60 idle days).
       - name: Save rotation state and price history
+        if: always() # keep history + rotation even if one platform failed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .esx_post_state.json data/prices.csv
+          git add .esx_post_state.json data/prices.csv 2>/dev/null || true
           git diff --cached --quiet || git commit -m "ESX snapshot $(date -u +%F)"
           git push
