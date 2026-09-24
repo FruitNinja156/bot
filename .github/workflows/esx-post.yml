@@ -3,14 +3,16 @@ name: ESX price post
 on:
   # Runs are started by cron-job.org (see README), because GitHub's own scheduler wasn't
   # firing for this repo. Each cron-job.org job sends a "mode" telling the bot what to do:
-  #   9:00 AM EAT          snapshot  - save prices, don't post (pre-open auction)
-  #   9:35 AM, 10 AM-3 PM  hourly    - post only if prices changed since the last post
-  #   3:45 PM EAT          close     - always post the closing prices
+  #   9:00 AM EAT   snapshot  -> 🌅 PRE-OPENING post (last close), always posts
+  #   9:35 AM EAT   hourly    -> 🔔 OPENING post (any hourly run before 10:00 EAT)
+  #   10 AM-3 PM    hourly    -> ⏱️ HOURLY UPDATE posts
+  #   (opening + hourly posts are skipped if prices haven't changed since the last post)
+  #   3:45 PM EAT   close     -> 🏁 CLOSING post, always posts
   # Don't also add a "schedule:" section here, or posts could happen twice.
   workflow_dispatch:
     inputs:
       mode:
-        description: "close = always post, hourly = post if prices changed, snapshot = save only"
+        description: "close = closing post, hourly = opening/hourly post if prices changed, snapshot = pre-opening post"
         type: choice
         options: [close, hourly, snapshot]
         default: close
@@ -46,16 +48,18 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}               # Console. Each post costs
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }} # ~$0.015 in X credits.
         run: |
+          HOUR=$(TZ=Africa/Addis_Ababa date +%-H)   # current hour in Ethiopia, e.g. 9 or 14
           case "${{ inputs.mode }}" in
-            snapshot)                           # 9:00 AM: save only
-              echo "Start of day: saving prices, nothing posted."
-              python esx_bot.py --csv data/prices.csv ;;
-            hourly)                             # 9:35 AM + on the hour: post if prices changed
-              echo "Trading-hours update: posting only if prices changed."
-              python esx_bot.py --send telegram --skip-if-unchanged --csv data/prices.csv ;;
+            snapshot)                           # 9:00 AM: pre-opening post (last close)
+              echo "Pre-opening post."
+              python esx_bot.py --send telegram --session preopen --csv data/prices.csv ;;
+            hourly)                             # 9:35 AM = opening, 10 AM-3 PM = hourly
+              if [ "$HOUR" -lt 10 ]; then SESSION=opening; else SESSION=hourly; fi
+              echo "Trading-hours post ($SESSION), only if prices changed."
+              python esx_bot.py --send telegram --skip-if-unchanged --session $SESSION --csv data/prices.csv ;;
             *)                                  # close (3:45 PM) or the Run workflow button
-              echo "Closing update: always posting."
-              python esx_bot.py --send all --csv data/prices.csv ;;
+              echo "Closing post."
+              python esx_bot.py --send all --session closing --csv data/prices.csv ;;
           esac
 
       # Committing each run keeps the template rotation going between runs, builds your
