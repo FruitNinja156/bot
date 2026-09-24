@@ -17,6 +17,9 @@ Usage:
   python esx_bot.py --post               # emoji post text, next template in the rotation
   python esx_bot.py --post --template 2  # emoji post text using a specific template
   python esx_bot.py --send               # build the post AND send it to Telegram
+  python esx_bot.py --send linkedin      # ...to LinkedIn
+  python esx_bot.py --send x             # ...to X (Twitter), in a compact 280-character format
+  python esx_bot.py --send all           # ...to every platform whose token is set
 
 Requires: pip install requests
 """
@@ -46,6 +49,25 @@ HEADERS = {"User-Agent": "esx-personal-price-bot/0.1 (personal use)"}
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# >>> LINKEDIN ACCESS TOKEN GOES HERE (also via environment / GitHub Secrets) <<<
+#   LINKEDIN_ACCESS_TOKEN - from LinkedIn's OAuth token generator (scopes: openid profile w_member_social).
+#                           EXPIRES AFTER 60 DAYS - generate a new one and update the secret.
+#   LINKEDIN_AUTHOR_URN   - optional. Leave unset to post as yourself (looked up automatically).
+#                           Set to urn:li:organization:<id> only if LinkedIn approves you for page posting.
+LINKEDIN_ACCESS_TOKEN = os.environ.get("LINKEDIN_ACCESS_TOKEN")
+LINKEDIN_AUTHOR_URN = os.environ.get("LINKEDIN_AUTHOR_URN")
+LINKEDIN_VERSION = os.environ.get("LINKEDIN_VERSION", "202606")  # LinkedIn API version, YYYYMM
+
+# >>> X (TWITTER) KEYS GO HERE (also via environment / GitHub Secrets) <<<
+# All four come from your app in the X Developer Console ("Keys and tokens"). They don't expire.
+# Set the app's permissions to "Read and write" BEFORE generating the access token + secret.
+X_API_KEY = os.environ.get("X_API_KEY")                      # a.k.a. Consumer Key
+X_API_SECRET = os.environ.get("X_API_SECRET")                # a.k.a. Consumer Secret
+X_ACCESS_TOKEN = os.environ.get("X_ACCESS_TOKEN")
+X_ACCESS_TOKEN_SECRET = os.environ.get("X_ACCESS_TOKEN_SECRET")
+# 280 for standard accounts. With X Premium you can set this higher (e.g. 4000) to avoid splitting.
+X_MAX_CHARS = int(os.environ.get("X_MAX_CHARS") or 280)
 
 # The nonce sits in the same inline script as the action name; match either ordering.
 NONCE_PATTERNS = [
@@ -171,20 +193,43 @@ def _top_line(rows):
     return "\n".join(parts)
 
 
-def _next_template_index():
-    """Read the rotation position, advance it, and save it for next time."""
+def _load_state():
     try:
         with open(STATE_FILE) as f:
-            idx = json.load(f).get("next", 0)
+            return json.load(f)
     except (OSError, ValueError):
-        idx = 0
-    idx %= len(TEMPLATES)
+        return {}
+
+
+def _save_state(state):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"next": (idx + 1) % len(TEMPLATES)}, f)
+            json.dump(state, f)
     except OSError:
-        pass  # rotation just won't persist; the post still works
+        pass  # rotation/dedupe just won't persist; posting still works
+
+
+def _next_template_index():
+    """Read the rotation position, advance it, and save it for next time."""
+    state = _load_state()
+    idx = state.get("next", 0) % len(TEMPLATES)
+    state["next"] = (idx + 1) % len(TEMPLATES)
+    _save_state(state)
     return idx
+
+
+def _snapshot(rows):
+    return sorted([r["symbol"], r["price"], r["change_pct"]] for r in rows)
+
+
+def prices_unchanged_since_last_post(rows):
+    return _load_state().get("last_posted") == _snapshot(rows)
+
+
+def remember_posted(rows):
+    state = _load_state()
+    state["last_posted"] = _snapshot(rows)
+    _save_state(state)
 
 
 def _post_datetime(dt):
@@ -211,6 +256,52 @@ def build_post(rows, fetched_at, template_index=None):
     ).strip()
 
 
+# Short rotating headers for X, where every character counts. {date} is filled in.
+X_HEADERS = [
+    "📊 ESX Update · {date}",
+    "🇪🇹 ESX Prices · {date}",
+    "💹 Today on the ESX · {date}",
+    "🔔 ESX Price Check · {date}",
+    "📈📉 ESX Movers · {date}",
+]
+
+
+def x_length(text):
+    """Approximate X's weighted count: basic Latin/punctuation = 1, emoji and most others = 2.
+    Errs on the high side so posts are never rejected for length."""
+    n = 0
+    for ch in text:
+        c = ord(ch)
+        light = c <= 0x10FF or 0x2000 <= c <= 0x200D or 0x2010 <= c <= 0x201F or 0x2032 <= c <= 0x2037
+        n += 1 if light else 2
+    return n
+
+
+def build_x_posts(rows, fetched_at, template_index):
+    """Compact version for X. Returns a list of posts, split into (1/2), (2/2)... if too long."""
+    ordered = sorted(rows, key=lambda r: -r["change_pct"])
+    lines = []
+    for r in ordered:
+        pct = r["change_pct"]
+        pct_txt = "0%" if pct == 0 else f"{pct:+.2f}%"
+        lines.append(f"{_status(pct)} {r['symbol']} {r['price']:,.2f} {pct_txt}")
+    header = X_HEADERS[template_index % len(X_HEADERS)].format(date=_post_datetime(fetched_at))
+
+    # Pack lines into as few posts as possible (reserving room for a " (1/2)" marker).
+    posts, current = [], []
+    for line in lines:
+        candidate = "\n".join([header + " (9/9)", ""] + current + [line])
+        if current and x_length(candidate) > X_MAX_CHARS:
+            posts.append(current)
+            current = []
+        current.append(line)
+    posts.append(current)
+
+    if len(posts) == 1:
+        return ["\n".join([header, ""] + posts[0])]
+    return ["\n".join([f"{header} ({i}/{len(posts)})", ""] + chunk) for i, chunk in enumerate(posts, 1)]
+
+
 def send_telegram(text):
     """Post text to the Telegram chat/channel configured above."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -228,6 +319,131 @@ def send_telegram(text):
     if not ok:
         # Never echo the URL: it contains the token.
         raise ESXError(f"Telegram rejected the message: {desc}")
+
+
+# LinkedIn post text uses "little text format": these characters must be backslash-escaped,
+# otherwise the post is rejected or cut off (our posts use ( ) and | for example).
+_LI_RESERVED = re.compile(r"([\\|{}@\[\]()<>#*_~])")
+
+
+def _linkedin_escape(text):
+    return _LI_RESERVED.sub(r"\\\1", text)
+
+
+def send_linkedin(text):
+    """Publish text as a LinkedIn post."""
+    if not LINKEDIN_ACCESS_TOKEN:
+        raise ESXError("LINKEDIN_ACCESS_TOKEN must be set to post to LinkedIn.")
+    auth = {"Authorization": f"Bearer {LINKEDIN_ACCESS_TOKEN}"}
+
+    author = LINKEDIN_AUTHOR_URN
+    if not author:
+        r = requests.get("https://api.linkedin.com/v2/userinfo", headers=auth, timeout=20)
+        if r.status_code == 401:
+            raise ESXError("LinkedIn token is expired or invalid - generate a new one (it lasts 60 days) "
+                           "and update the LINKEDIN_ACCESS_TOKEN secret.")
+        r.raise_for_status()
+        author = f"urn:li:person:{r.json()['sub']}"
+
+    r = requests.post(
+        "https://api.linkedin.com/rest/posts",
+        headers={**auth, "LinkedIn-Version": LINKEDIN_VERSION,
+                 "X-Restli-Protocol-Version": "2.0.0", "Content-Type": "application/json"},
+        json={
+            "author": author,
+            "commentary": _linkedin_escape(text[:3000]),  # LinkedIn's post length limit
+            "visibility": "PUBLIC",
+            "distribution": {"feedDistribution": "MAIN_FEED", "targetEntities": [],
+                             "thirdPartyDistributionChannels": []},
+            "lifecycleState": "PUBLISHED",
+            "isReshareDisabledByAuthor": False,
+        },
+        timeout=20,
+    )
+    if r.status_code == 401:
+        raise ESXError("LinkedIn token is expired or invalid - generate a new one (it lasts 60 days) "
+                       "and update the LINKEDIN_ACCESS_TOKEN secret.")
+    if r.status_code not in (200, 201):
+        try:
+            msg = r.json().get("message", r.text[:200])
+        except ValueError:
+            msg = r.text[:200]
+        raise ESXError(f"LinkedIn rejected the post ({r.status_code}): {msg}")
+
+
+def _x_configured():
+    return all([X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET])
+
+
+def _x_create(auth, text, reply_to=None):
+    body = {"text": text}
+    if reply_to:
+        body["reply"] = {"in_reply_to_tweet_id": reply_to}
+    return requests.post("https://api.x.com/2/tweets", json=body, auth=auth, timeout=20)
+
+
+def _x_error(r):
+    try:
+        j = r.json()
+        return (j.get("detail") or j.get("title") or str(j)[:200]).rstrip(".")
+    except ValueError:
+        return r.text[:200]
+
+
+def send_x(parts):
+    """Post to X. Multiple parts are threaded; if X refuses the reply, they're posted separately."""
+    if not _x_configured():
+        raise ESXError("X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN and X_ACCESS_TOKEN_SECRET must all be set.")
+    from requests_oauthlib import OAuth1  # only needed for X
+    auth = OAuth1(X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET)
+
+    previous_id = None
+    for i, text in enumerate(parts):
+        r = _x_create(auth, text, reply_to=previous_id)
+        if previous_id and r.status_code == 403:
+            r = _x_create(auth, text)  # thread reply refused: post it on its own instead
+        if r.status_code == 401:
+            raise ESXError("X rejected the keys (401). Re-check all four X secrets.")
+        if r.status_code == 402:
+            raise ESXError("X says payment required (402): add credits in the X Developer Console.")
+        if r.status_code == 403 and i == 0:
+            raise ESXError(f"X refused the post (403): {_x_error(r)}. If it mentions permissions, set the "
+                           "app to 'Read and write' and regenerate the access token + secret.")
+        if r.status_code not in (200, 201):
+            raise ESXError(f"X rejected post {i + 1}/{len(parts)} ({r.status_code}): {_x_error(r)}")
+        previous_id = r.json()["data"]["id"]
+
+
+# name -> (send function taking the built posts, "is it configured?" check)
+PLATFORMS = {
+    "telegram": (lambda p: send_telegram(p["full"]), lambda: bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)),
+    "linkedin": (lambda p: send_linkedin(p["full"]), lambda: bool(LINKEDIN_ACCESS_TOKEN)),
+    "x": (lambda p: send_x(p["x"]), _x_configured),
+}
+
+
+def send_everywhere(posts, targets):
+    """Send to each target; one platform failing doesn't stop the others."""
+    if targets == ["all"]:
+        targets = [name for name, (_, configured) in PLATFORMS.items() if configured()]
+        if not targets:
+            raise ESXError("No platforms configured - set the Telegram, LinkedIn and/or X secrets.")
+    failures, posted = [], []
+    for name in targets:
+        if name not in PLATFORMS:
+            failures.append(f"{name}: unknown platform (use telegram, linkedin, x or all)")
+            continue
+        try:
+            PLATFORMS[name][0](posts)
+            posted.append(name)
+            print(f"✅ Posted to {name.upper() if name == 'x' else name.capitalize()}.")
+        except (requests.RequestException, ESXError) as e:
+            print(f"❌ {name.upper() if name == 'x' else name.capitalize()} failed: {e}", file=sys.stderr)
+            failures.append(f"{name}: {e}")
+    if failures:
+        err = ESXError("Some posts failed -> " + " | ".join(failures))
+        err.posted_somewhere = bool(posted)
+        raise err
 
 
 def append_csv(path, rows, fetched_at):
@@ -250,16 +466,30 @@ def run_once(client, args):
     now = datetime.now(timezone.utc)
     if args.json:
         print(json.dumps({"fetched_at": now.isoformat(), "prices": rows}, indent=2))
-    elif args.post or args.send:
-        text = build_post(rows, now, args.template)
-        print(text)
-        if args.send:
-            send_telegram(text)
-            print("\n✅ Posted to Telegram.")
+    if args.csv:
+        append_csv(args.csv, rows, now)  # save history even if a platform fails later
+    if args.json:
+        return
+    if args.send is not None and args.skip_if_unchanged and prices_unchanged_since_last_post(rows):
+        print("Prices unchanged since the last post - saved, not posted.")
+        return
+    if args.post or args.send is not None:
+        idx = args.template if args.template is not None else _next_template_index()
+        posts = {"full": build_post(rows, now, idx), "x": build_x_posts(rows, now, idx)}
+        print(posts["full"] + "\n")
+        for i, part in enumerate(posts["x"], 1):
+            print(f"--- X version, post {i}/{len(posts['x'])} ({x_length(part)}/{X_MAX_CHARS} chars) ---")
+            print(part + "\n")
+        if args.send is not None:
+            try:
+                send_everywhere(posts, args.send or ["telegram"])
+            except ESXError as e:
+                if getattr(e, "posted_somewhere", False):
+                    remember_posted(rows)  # at least one platform got it; don't repeat it there
+                raise
+            remember_posted(rows)
     else:
         print_table(rows, now)
-    if args.csv:
-        append_csv(args.csv, rows, now)
 
 
 def main():
@@ -269,8 +499,11 @@ def main():
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
     p.add_argument("--post", action="store_true",
                    help="print a ready-to-post message (rotates through TEMPLATES)")
-    p.add_argument("--send", action="store_true",
-                   help="post the message to Telegram (needs TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
+    p.add_argument("--send", nargs="*", metavar="PLATFORM",
+                   help="post the message: --send (Telegram), --send linkedin, --send x, "
+                        "--send telegram x ..., or --send all (every configured platform)")
+    p.add_argument("--skip-if-unchanged", action="store_true",
+                   help="with --send, don't post if prices are identical to the last post")
     p.add_argument("--template", type=int, metavar="N",
                    help="with --post, use template N (0-based) instead of the rotation")
     p.add_argument("--watch", type=float, metavar="MINUTES", help="repeat every N minutes (min 5)")
