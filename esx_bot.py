@@ -135,12 +135,14 @@ def print_table(rows, fetched_at):
 # Post formatting
 # ---------------------------------------------------------------------------
 
-# Optional display names. Symbols not listed here are shown as the bare ticker.
-# Add or correct names as you like, e.g. "TELE": "Ethio Telecom".
-NAMES = {
-    "AWAB": "Awash Bank",
-    "WGBX": "Wegagen Bank",
-    "GDAB": "Gadaa Bank",
+# Optional display names, shown as "AWAB (Awash Bank)". Empty = tickers only (current choice).
+# To add one later: "AWAB": "Awash Bank",
+NAMES = {}
+
+# Symbols that are interest rates, not share prices. They get their own line ("🏦 IBMM ... 13.00%")
+# and are left out of the gainers/decliners lists, the counts and the top gainer/loser.
+RATES = {
+    "IBMM": "interbank rate",
 }
 
 UP, DOWN, FLAT = "🟢", "🔴", "⚪"
@@ -149,7 +151,7 @@ UP, DOWN, FLAT = "🟢", "🔴", "⚪"
 # The bot cycles through these in order, one per post, then starts over.
 # Add, remove or edit freely; just keep {body} somewhere in each one.
 TEMPLATES = [
-    "📊 ESX Market Update | {date}\n\n{body}\n\n{top_line}\n🟢 {ups} up  🔴 {downs} down  ⚪ {flats} flat",
+    "📊 ESX Market Update | {date}\n\n{body}\n\n{top_line}\n🟢 {ups} up · 🔴 {downs} down · ⚪ {flats} flat",
 
     "🇪🇹 Ethiopian Securities Exchange\n🗓️ {date}\n\n{body}\n\n{top_line}",
 
@@ -175,11 +177,37 @@ def format_security(r):
     name = NAMES.get(r["symbol"])
     label = f"{r['symbol']} ({name})" if name else r["symbol"]
     pct = r["change_pct"]
-    pct_txt = "0.00%" if pct == 0 else f"{pct:+.2f}%"
-    return f"{_status(pct)} {label}\n     ETB {r['price']:,.2f}  ({pct_txt})"
+    move = "0.00%" if pct == 0 else f"{'▲' if pct > 0 else '▼'} {pct:+.2f}%"
+    return f"{_status(pct)} {label}\n     ETB {r['price']:,.2f}  {move}"
+
+
+SECTIONS = [  # (heading, which securities go under it)
+    ("📈 GAINERS", lambda pct: pct > 0),
+    ("➖ UNCHANGED", lambda pct: pct == 0),
+    ("📉 DECLINERS", lambda pct: pct < 0),
+]
+
+
+def _stocks(rows):
+    return [r for r in rows if r["symbol"] not in RATES]
+
+
+def _body(rows):
+    """Grouped list: gainers, unchanged, decliners (empty groups left out), then rate lines."""
+    ordered = sorted(_stocks(rows), key=lambda r: -r["change_pct"])
+    blocks = []
+    for heading, belongs in SECTIONS:
+        group = [r for r in ordered if belongs(r["change_pct"])]
+        if group:
+            blocks.append(heading + "\n\n" + "\n\n".join(format_security(r) for r in group))
+    for r in rows:
+        if r["symbol"] in RATES:
+            blocks.append(f"🏦 {r['symbol']} ({RATES[r['symbol']]}): {r['price']:.2f}%")
+    return "\n\n".join(blocks)
 
 
 def _top_line(rows):
+    rows = _stocks(rows)
     movers = [r for r in rows if r["change_pct"] != 0]
     if not movers:
         return "😴 No price changes today."
@@ -239,21 +267,33 @@ def _post_datetime(dt):
     return f"{local:%a %d %b %Y} · {hour}:{local:%M %p} {POST_TZ_LABEL}"
 
 
-def build_post(rows, fetched_at, template_index=None):
-    """Return the post text. Uses the next template in rotation unless one is given."""
+# Session labels: the first line of each post, so readers know what kind of update it is.
+# (full label, short label for X)
+SESSIONS = {
+    "preopen": ("🌅 PRE-OPENING · Last close, before trading starts", "🌅 PRE-OPENING"),
+    "opening": ("🔔 OPENING · First prices of the day", "🔔 OPENING"),
+    "hourly": ("⏱️ HOURLY UPDATE", "⏱️ HOURLY"),
+    "closing": ("🏁 CLOSING · Final prices for the day", "🏁 CLOSING"),
+}
+
+
+def build_post(rows, fetched_at, template_index=None, session=None):
+    """Return the post text. Uses the next template in rotation unless one is given.
+    session (preopen/opening/hourly/closing) adds a label as the first line."""
     if template_index is None:
         template_index = _next_template_index()
-    # Gainers first, then flat, then decliners; blank line between securities.
-    ordered = sorted(rows, key=lambda r: -r["change_pct"])
-    body = "\n\n".join(format_security(r) for r in ordered)
-    return TEMPLATES[template_index % len(TEMPLATES)].format(
+    stocks = _stocks(rows)
+    post = TEMPLATES[template_index % len(TEMPLATES)].format(
         date=_post_datetime(fetched_at),
-        body=body,
-        ups=sum(r["change_pct"] > 0 for r in rows),
-        downs=sum(r["change_pct"] < 0 for r in rows),
-        flats=sum(r["change_pct"] == 0 for r in rows),
+        body=_body(rows),
+        ups=sum(r["change_pct"] > 0 for r in stocks),
+        downs=sum(r["change_pct"] < 0 for r in stocks),
+        flats=sum(r["change_pct"] == 0 for r in stocks),
         top_line=_top_line(rows),
     ).strip()
+    if session:
+        return SESSIONS[session][0] + "\n\n" + post
+    return post
 
 
 # Short rotating headers for X, where every character counts. {date} is filled in.
@@ -277,7 +317,7 @@ def x_length(text):
     return n
 
 
-def build_x_posts(rows, fetched_at, template_index):
+def build_x_posts(rows, fetched_at, template_index, session=None):
     """Compact version for X. Returns a list of posts, split into (1/2), (2/2)... if too long."""
     ordered = sorted(rows, key=lambda r: -r["change_pct"])
     lines = []
@@ -286,6 +326,8 @@ def build_x_posts(rows, fetched_at, template_index):
         pct_txt = "0%" if pct == 0 else f"{pct:+.2f}%"
         lines.append(f"{_status(pct)} {r['symbol']} {r['price']:,.2f} {pct_txt}")
     header = X_HEADERS[template_index % len(X_HEADERS)].format(date=_post_datetime(fetched_at))
+    if session:
+        header = SESSIONS[session][1] + " · " + header
 
     # Pack lines into as few posts as possible (reserving room for a " (1/2)" marker).
     posts, current = [], []
@@ -475,7 +517,8 @@ def run_once(client, args):
         return
     if args.post or args.send is not None:
         idx = args.template if args.template is not None else _next_template_index()
-        posts = {"full": build_post(rows, now, idx), "x": build_x_posts(rows, now, idx)}
+        posts = {"full": build_post(rows, now, idx, args.session),
+                 "x": build_x_posts(rows, now, idx, args.session)}
         print(posts["full"] + "\n")
         for i, part in enumerate(posts["x"], 1):
             print(f"--- X version, post {i}/{len(posts['x'])} ({x_length(part)}/{X_MAX_CHARS} chars) ---")
@@ -504,6 +547,8 @@ def main():
                         "--send telegram x ..., or --send all (every configured platform)")
     p.add_argument("--skip-if-unchanged", action="store_true",
                    help="with --send, don't post if prices are identical to the last post")
+    p.add_argument("--session", choices=list(SESSIONS),
+                   help="label the post as pre-opening, opening, hourly or closing")
     p.add_argument("--template", type=int, metavar="N",
                    help="with --post, use template N (0-based) instead of the rotation")
     p.add_argument("--watch", type=float, metavar="MINUTES", help="repeat every N minutes (min 5)")
