@@ -5,8 +5,12 @@ on:
     # Times are UTC. Ethiopia (EAT) is always UTC+3, with no daylight saving, so subtract 3 hours.
     # GitHub often starts scheduled runs 10-30 minutes late; that's normal.
     # ESX day (EAT): pre-open 9:00-9:30, trading 9:30-3:00 PM, closing session 3:00 PM.
-    - cron: "45 6 * * 1-5"   # 9:45 AM EAT, Mon-Fri: opening prices, after the pre-open auction
-    - cron: "45 12 * * 1-5"  # 3:45 PM EAT, Mon-Fri: final closing prices
+    - cron: "0 6 * * 1-5"      # 9:00 AM EAT: start of day - price snapshot saved, not posted
+                               # (9:00-9:30 is the pre-open auction; the ticker still shows yesterday)
+    - cron: "35 6 * * 1-5"     # 9:35 AM EAT: first post, 5 min after trading opens at 9:30
+    - cron: "0 7-12 * * 1-5"   # 10 AM, 11 AM, 12 PM, 1 PM, 2 PM, 3 PM EAT: post on the hour
+                               # (9:35 + hourly posts are skipped if prices haven't changed since the last post)
+    - cron: "45 12 * * 1-5"    # 3:45 PM EAT: final closing prices (always posts)
   workflow_dispatch: # adds a "Run workflow" button so you can test or post on demand
 
 permissions:
@@ -39,8 +43,17 @@ jobs:
           X_API_SECRET: ${{ secrets.X_API_SECRET }}                   # come from the X Developer
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}               # Console. Each post costs
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }} # ~$0.015 in X credits.
-        # "all" = every platform whose secrets are set. Remove a platform's secrets to stop posting there.
-        run: python esx_bot.py --send all --csv data/prices.csv
+        run: |
+          case "${{ github.event.schedule }}" in
+            "0 6 * * 1-5")                      # 9:00 AM: snapshot only
+              echo "Start of day: saving prices, nothing posted."
+              python esx_bot.py --csv data/prices.csv ;;
+            "35 6 * * 1-5"|"0 7-12 * * 1-5")    # 9:35 AM + hourly: post if prices changed
+              echo "Trading-hours update: posting only if prices changed."
+              python esx_bot.py --send telegram --skip-if-unchanged --csv data/prices.csv ;;
+            *)                                  # 3:45 PM close, or a manual run: always post
+              python esx_bot.py --send all --csv data/prices.csv ;;
+          esac
 
       # Committing each run keeps the template rotation going between runs, builds your
       # price history, and counts as repo activity (GitHub pauses schedules after 60 idle days).
@@ -50,5 +63,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .esx_post_state.json data/prices.csv 2>/dev/null || true
-          git diff --cached --quiet || git commit -m "ESX snapshot $(date -u +%F)"
+          git diff --cached --quiet || git commit -m "ESX snapshot $(date -u '+%F %H:%M') UTC"
+          git pull --rebase --quiet || true  # in case you edited files on GitHub during the run
           git push
