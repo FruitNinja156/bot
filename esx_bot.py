@@ -260,6 +260,24 @@ def remember_posted(rows):
     _save_state(state)
 
 
+def find_new_listings(rows):
+    """Securities the bot has never seen before. The very first time this runs, it just records
+    what's listed now (so existing companies aren't announced as new) and returns nothing."""
+    known = _load_state().get("known_symbols")
+    if known is None:
+        remember_symbols(rows)
+        return []
+    return [r for r in rows if r["symbol"] not in set(known)]
+
+
+def remember_symbols(rows):
+    """Add these tickers to the known list. Tickers are never removed, so one that briefly
+    drops off the ESX ticker isn't announced again when it comes back."""
+    state = _load_state()
+    state["known_symbols"] = sorted(set(state.get("known_symbols") or []) | {r["symbol"] for r in rows})
+    _save_state(state)
+
+
 def _post_datetime(dt):
     """e.g. 'Thu 24 Sep 2026 · 12:00 PM EAT'"""
     local = dt.astimezone(POST_TZ)
@@ -294,6 +312,30 @@ def build_post(rows, fetched_at, template_index=None, session=None):
     if session:
         return SESSIONS[session][0] + "\n\n" + post
     return post
+
+
+# New-listing announcement: sent as its own message, before the regular update, the first time
+# a ticker appears. Edit the wording freely. Fields: {symbol} {price} {move} {date}
+LISTING_TEMPLATE = (
+    "🆕 NEW LISTING ON ESX\n\n"
+    "🎉 {symbol} has joined the Ethiopian Securities Exchange!\n\n"
+    "💰 First price: ETB {price}{move}\n"
+    "📅 {date}\n\n"
+    "Welcome to the market! 🇪🇹"
+)
+LISTING_TEMPLATE_X = "🆕 NEW LISTING ON ESX: {symbol} has joined! 🎉 First price ETB {price}{move} · {date}"
+
+
+def build_listing_posts(new_rows, fetched_at):
+    """One announcement per new security: {"full": [texts], "x": [texts]}."""
+    full, x = [], []
+    for r in new_rows:
+        pct = r["change_pct"]
+        fields = dict(symbol=r["symbol"], price=f"{r['price']:,.2f}", date=_post_datetime(fetched_at),
+                      move="" if pct == 0 else f"  {'▲' if pct > 0 else '▼'} {pct:+.2f}%")
+        full.append(LISTING_TEMPLATE.format(**fields))
+        x.append(LISTING_TEMPLATE_X.format(**fields))
+    return {"full": full, "x": x}
 
 
 # Short rotating headers for X, where every character counts. {date} is filled in.
@@ -512,6 +554,33 @@ def run_once(client, args):
         append_csv(args.csv, rows, now)  # save history even if a platform fails later
     if args.json:
         return
+
+    # 1. New listings: announced on their own, whichever job spots them first.
+    listing_error = None
+    new = [] if args.symbols else (find_new_listings(rows) if args.send is not None else [])
+    if new:
+        ann = build_listing_posts(new, now)
+        for n, (full, xtext) in enumerate(zip(ann["full"], ann["x"])):
+            print(f"--- NEW LISTING: {new[n]['symbol']} ---\n{full}\n")
+            try:
+                send_everywhere({"full": full, "x": [xtext]}, args.send or ["telegram"])
+                remember_symbols([new[n]])
+            except ESXError as e:
+                if getattr(e, "posted_somewhere", False):
+                    remember_symbols([new[n]])  # announced somewhere; don't repeat it there
+                listing_error = e  # still go on to the regular update
+    elif args.send is not None and not args.symbols:
+        remember_symbols(rows)
+
+    # 2. The regular update.
+    try:
+        _regular_update(rows, now, args)
+    finally:
+        if listing_error:
+            raise listing_error
+
+
+def _regular_update(rows, now, args):
     if args.send is not None and args.skip_if_unchanged and prices_unchanged_since_last_post(rows):
         print("Prices unchanged since the last post - saved, not posted.")
         return
