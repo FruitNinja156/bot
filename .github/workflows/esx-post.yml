@@ -1,17 +1,19 @@
 name: ESX price post
 
 on:
-  schedule:
-    # Times are UTC. Ethiopia (EAT) is always UTC+3, with no daylight saving, so subtract 3 hours.
-    # GitHub often starts scheduled runs 10-30 minutes late; that's normal.
-    # ESX day (EAT): pre-open 9:00-9:30, trading 9:30-3:00 PM, closing session 3:00 PM.
-    - cron: "0 6 * * 1-5"      # 9:00 AM EAT: start of day - price snapshot saved, not posted
-                               # (9:00-9:30 is the pre-open auction; the ticker still shows yesterday)
-    - cron: "35 6 * * 1-5"     # 9:35 AM EAT: first post, 5 min after trading opens at 9:30
-    - cron: "0 7-12 * * 1-5"   # 10 AM, 11 AM, 12 PM, 1 PM, 2 PM, 3 PM EAT: post on the hour
-                               # (9:35 + hourly posts are skipped if prices haven't changed since the last post)
-    - cron: "45 12 * * 1-5"    # 3:45 PM EAT: final closing prices (always posts)
-  workflow_dispatch: # adds a "Run workflow" button so you can test or post on demand
+  # Runs are started by cron-job.org (see README), because GitHub's own scheduler wasn't
+  # firing for this repo. Each cron-job.org job sends a "mode" telling the bot what to do:
+  #   9:00 AM EAT          snapshot  - save prices, don't post (pre-open auction)
+  #   9:35 AM, 10 AM-3 PM  hourly    - post only if prices changed since the last post
+  #   3:45 PM EAT          close     - always post the closing prices
+  # Don't also add a "schedule:" section here, or posts could happen twice.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "close = always post, hourly = post if prices changed, snapshot = save only"
+        type: choice
+        options: [close, hourly, snapshot]
+        default: close
 
 permissions:
   contents: write # lets the job save the template rotation + price history back to the repo
@@ -44,14 +46,15 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}               # Console. Each post costs
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }} # ~$0.015 in X credits.
         run: |
-          case "${{ github.event.schedule }}" in
-            "0 6 * * 1-5")                      # 9:00 AM: snapshot only
+          case "${{ inputs.mode }}" in
+            snapshot)                           # 9:00 AM: save only
               echo "Start of day: saving prices, nothing posted."
               python esx_bot.py --csv data/prices.csv ;;
-            "35 6 * * 1-5"|"0 7-12 * * 1-5")    # 9:35 AM + hourly: post if prices changed
+            hourly)                             # 9:35 AM + on the hour: post if prices changed
               echo "Trading-hours update: posting only if prices changed."
               python esx_bot.py --send telegram --skip-if-unchanged --csv data/prices.csv ;;
-            *)                                  # 3:45 PM close, or a manual run: always post
+            *)                                  # close (3:45 PM) or the Run workflow button
+              echo "Closing update: always posting."
               python esx_bot.py --send all --csv data/prices.csv ;;
           esac
 
