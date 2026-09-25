@@ -8,13 +8,15 @@ on:
   #   10 AM-3 PM    hourly    -> ⏱️ HOURLY UPDATE posts
   #   (opening + hourly posts are skipped if prices haven't changed since the last post)
   #   3:45 PM EAT   close     -> 🏁 CLOSING post, always posts
+  #                             + daily recap image (and weekly on Fridays) saved to reports/
+  #   (button only) recap       -> rebuild the recap images now, nothing posted
   # Don't also add a "schedule:" section here, or posts could happen twice.
   workflow_dispatch:
     inputs:
       mode:
-        description: "close = closing post, hourly = opening/hourly post if prices changed, snapshot = pre-opening post"
+        description: "close = closing post, hourly = opening/hourly post if prices changed, snapshot = pre-opening post, recap = rebuild recap images only (no post)"
         type: choice
-        options: [close, hourly, snapshot]
+        options: [close, hourly, snapshot, recap]
         default: close
 
 permissions:
@@ -57,10 +59,24 @@ jobs:
               if [ "$HOUR" -lt 10 ]; then SESSION=opening; else SESSION=hourly; fi
               echo "Trading-hours post ($SESSION), only if prices changed."
               python esx_bot.py --send telegram --skip-if-unchanged --session $SESSION --csv data/prices.csv ;;
+            recap)                              # button only: images below, no post
+              echo "Recap only: nothing posted." ;;
             *)                                  # close (3:45 PM) or the Run workflow button
               echo "Closing post."
               python esx_bot.py --send all --session closing --csv data/prices.csv ;;
           esac
+
+      # Recap images for you to post manually: saved to reports/, never posted automatically.
+      # If this step fails, the posts above are unaffected.
+      - name: Build recap images (saved to reports/, not posted)
+        if: always() && (inputs.mode == 'close' || inputs.mode == 'recap')
+        continue-on-error: true
+        run: |
+          pip install -q "matplotlib>=3.8"
+          python recap.py --daily
+          if [ "$(TZ=Africa/Addis_Ababa date +%u)" = "5" ] || [ "${{ inputs.mode }}" = "recap" ]; then
+            python recap.py --weekly   # Fridays: Monday-Friday recap
+          fi
 
       # Committing each run keeps the template rotation going between runs, builds your
       # price history, and counts as repo activity (GitHub pauses schedules after 60 idle days).
@@ -70,6 +86,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .esx_post_state.json data/prices.csv 2>/dev/null || true
+          if [ -d reports ]; then git add reports; fi
           git diff --cached --quiet || git commit -m "ESX snapshot $(date -u '+%F %H:%M') UTC"
           git pull --rebase --quiet || true  # in case you edited files on GitHub during the run
           git push
