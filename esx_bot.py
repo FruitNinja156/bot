@@ -80,6 +80,15 @@ class ESXError(Exception):
     pass
 
 
+class ESXUnreachable(ESXError):
+    """esx.et refused or timed out on every try. Raised before anything is posted."""
+
+
+# Waits (seconds) between tries when esx.et refuses the connection, times out or is overloaded.
+RETRY_WAITS = (15, 30, 60)
+RETRY_STATUS = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
 class ESXClient:
     def __init__(self, timeout=20):
         self.s = requests.Session()
@@ -87,8 +96,25 @@ class ESXClient:
         self.timeout = timeout
         self._nonce = None
 
+    def _request(self, method, url, **kw):
+        """One request to esx.et, retried after 15, 30 and 60 seconds if the site refuses the
+        connection, times out or is overloaded. Other answers (e.g. 403) are returned as they are."""
+        last = None
+        for i in range(len(RETRY_WAITS) + 1):
+            try:
+                r = self.s.request(method, url, timeout=self.timeout, **kw)
+                if r.status_code not in RETRY_STATUS:
+                    return r
+                last = f"HTTP {r.status_code}"
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last = type(e).__name__
+            if i < len(RETRY_WAITS):
+                print(f"esx.et not reachable ({last}), trying again in {RETRY_WAITS[i]}s...", file=sys.stderr)
+                time.sleep(RETRY_WAITS[i])
+        raise ESXUnreachable(f"esx.et could not be reached after {len(RETRY_WAITS) + 1} tries ({last}).")
+
     def _refresh_nonce(self):
-        r = self.s.get(BASE + "/", timeout=self.timeout)
+        r = self._request("GET", BASE + "/")
         r.raise_for_status()
         for pat in NONCE_PATTERNS:
             m = pat.search(r.text)
@@ -102,8 +128,7 @@ class ESXClient:
         for attempt in range(2):
             if self._nonce is None:
                 self._refresh_nonce()
-            r = self.s.post(AJAX, data={"action": "esx_get_ticker", "nonce": self._nonce},
-                            timeout=self.timeout)
+            r = self._request("POST", AJAX, data={"action": "esx_get_ticker", "nonce": self._nonce})
             if r.status_code == 403 and attempt == 0:
                 self._nonce = None  # expired nonce - fetch a fresh one and retry once
                 continue
@@ -627,6 +652,9 @@ def main():
     if not args.watch:
         try:
             run_once(client, args)
+        except ESXUnreachable as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(3)  # exit code 3 = esx.et unreachable, nothing was posted (the workflow retries)
         except (requests.RequestException, ESXError) as e:
             sys.exit(f"Error: {e}")
         return
