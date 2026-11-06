@@ -82,32 +82,50 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit $code
 
-      # If the bot said "Couldn't find the ticker nonce on the homepage" (exit code 1), grab
-      # the homepage the same way a browser would and keep it for 7 days, so you can see
-      # whether the layout changed or esx.et served a block/challenge page to GitHub.
+      # If the bot failed because of esx.et (exit code 1 = nonce not found, exit code 3 = couldn't
+      # connect), collect evidence and keep it for 7 days as the "esx-homepage-debug" artifact:
+      #   - the runner's public IP, whether esx.et resolves (DNS), and whether ports 443/80
+      #     accept a connection -> tells you if GitHub's servers are being cut off from esx.et
+      #   - the homepage as a browser would see it (exit code 1: layout change vs block page)
+      # The bot itself also saves what IT received to debug/homepage-bot.html (exit code 1 only).
       # NOTE: if esx_bot.py fetches a different URL than https://esx.et/, change ESX_URL below.
-      # This uses curl with a browser User-Agent; the bot itself saves what IT received to
-      # debug/homepage-bot.html (same artifact). If the two differ, esx.et treats the bot's
-      # User-Agent differently: try setting ESX_USER_AGENT in the "Fetch prices and post" env.
-      - name: Diagnose esx.et homepage (only if the bot failed with exit code 1)
-        if: failure() && steps.post.outputs.code == '1'
+      # If the curl and bot pages differ, esx.et treats the bot's User-Agent differently: try
+      # setting ESX_USER_AGENT in the "Fetch prices and post" env.
+      - name: Diagnose esx.et (only if the bot failed with exit code 1 or 3)
+        if: failure() && (steps.post.outputs.code == '1' || steps.post.outputs.code == '3')
         continue-on-error: true
         env:
           ESX_URL: https://esx.et/
+          ESX_HOST: esx.et
         run: |
           mkdir -p debug
-          curl -sS -L -m 30 \
+          {
+            echo "=== connectivity from this runner ($(date -u '+%F %H:%M:%S') UTC) ==="
+            echo "runner public IP: $(curl -sS -m 10 https://api.ipify.org 2>&1 || echo 'lookup failed')"
+            echo "DNS: $(getent hosts "$ESX_HOST" || echo "$ESX_HOST did not resolve")"
+            for port in 443 80; do
+              if timeout 10 bash -c "</dev/tcp/$ESX_HOST/$port" 2>/dev/null; then
+                echo "TCP $port: connected"
+              else
+                echo "TCP $port: failed or timed out (10s)"
+              fi
+            done
+            echo "=== homepage via curl (browser User-Agent) ==="
+          } 2>&1 | tee debug/summary.txt
+          curl -sS -L --connect-timeout 10 -m 30 \
             -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
             -o debug/homepage-curl.html \
             -w "HTTP %{http_code} | %{size_download} bytes | final URL: %{url_effective}\n" \
-            "$ESX_URL" | tee debug/summary.txt || true
-          echo "--- page title ---" | tee -a debug/summary.txt
-          grep -io '<title>[^<]*</title>' debug/homepage-curl.html | head -1 | tee -a debug/summary.txt || true
-          echo "--- text around 'nonce' (first 20 hits) ---" | tee -a debug/summary.txt
-          grep -io '.\{0,60\}nonce.\{0,80\}' debug/homepage-curl.html | head -20 | tee -a debug/summary.txt || true
+            "$ESX_URL" 2>&1 | tee -a debug/summary.txt || true
+          if [ -s debug/homepage-curl.html ]; then
+            echo "--- page title ---" | tee -a debug/summary.txt
+            grep -io '<title>[^<]*</title>' debug/homepage-curl.html | head -1 | tee -a debug/summary.txt || true
+            echo "--- text around 'nonce' (first 20 hits) ---" | tee -a debug/summary.txt
+            grep -io '.\{0,60\}nonce.\{0,80\}' debug/homepage-curl.html | head -20 | tee -a debug/summary.txt || true
+          fi
 
       - name: Upload homepage snapshot
-        if: failure() && steps.post.outputs.code == '1'
+        if: failure() && (steps.post.outputs.code == '1' || steps.post.outputs.code == '3')
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
