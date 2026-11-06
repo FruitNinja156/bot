@@ -11,6 +11,13 @@ on:
   #                             + daily recap image (and weekly on Fridays) saved to reports/
   #   (button only) recap       -> rebuild the recap images now, nothing posted
   # Don't also add a "schedule:" section here, or posts could happen twice.
+  #
+  # Bot exit codes:
+  #   0 = OK
+  #   1 = esx.et answered but the page didn't have the ticker nonce (layout changed, or the
+  #       site served a different/blocked page). A debug snapshot is uploaded as an artifact.
+  #   3 = esx.et unreachable
+  # Codes 1 and 3 both trigger a retry on a fresh server (max 3 attempts in total).
   workflow_dispatch:
     inputs:
       mode:
@@ -55,7 +62,7 @@ jobs:
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}               # Console. Each post costs
           X_ACCESS_TOKEN_SECRET: ${{ secrets.X_ACCESS_TOKEN_SECRET }} # ~$0.015 in X credits.
         run: |
-          set +e   # capture the bot's exit code (3 = esx.et unreachable, nothing posted)
+          set +e   # capture the bot's exit code (3 = esx.et unreachable, 1 = nonce not found; nothing posted)
           HOUR=$(TZ=Africa/Addis_Ababa date +%-H)   # current hour in Ethiopia, e.g. 9 or 14
           case "${{ inputs.mode }}" in
             snapshot)                           # 9:00 AM: pre-opening post (last close)
@@ -75,6 +82,39 @@ jobs:
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit $code
 
+      # If the bot said "Couldn't find the ticker nonce on the homepage" (exit code 1), grab
+      # the homepage the same way a browser would and keep it for 7 days, so you can see
+      # whether the layout changed or esx.et served a block/challenge page to GitHub.
+      # NOTE: if esx_bot.py fetches a different URL than https://esx.et/, change ESX_URL below.
+      # This uses curl with a browser User-Agent; the bot itself saves what IT received to
+      # debug/homepage-bot.html (same artifact). If the two differ, esx.et treats the bot's
+      # User-Agent differently: try setting ESX_USER_AGENT in the "Fetch prices and post" env.
+      - name: Diagnose esx.et homepage (only if the bot failed with exit code 1)
+        if: failure() && steps.post.outputs.code == '1'
+        continue-on-error: true
+        env:
+          ESX_URL: https://esx.et/
+        run: |
+          mkdir -p debug
+          curl -sS -L -m 30 \
+            -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" \
+            -o debug/homepage-curl.html \
+            -w "HTTP %{http_code} | %{size_download} bytes | final URL: %{url_effective}\n" \
+            "$ESX_URL" | tee debug/summary.txt || true
+          echo "--- page title ---" | tee -a debug/summary.txt
+          grep -io '<title>[^<]*</title>' debug/homepage-curl.html | head -1 | tee -a debug/summary.txt || true
+          echo "--- text around 'nonce' (first 20 hits) ---" | tee -a debug/summary.txt
+          grep -io '.\{0,60\}nonce.\{0,80\}' debug/homepage-curl.html | head -20 | tee -a debug/summary.txt || true
+
+      - name: Upload homepage snapshot
+        if: failure() && steps.post.outputs.code == '1'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: esx-homepage-debug
+          path: debug/
+          retention-days: 7
+
       # Recap images for you to post manually: saved to reports/, never posted automatically.
       # If this step fails, the posts above are unaffected.
       - name: Build recap images (saved to reports/, not posted)
@@ -89,6 +129,7 @@ jobs:
 
       # Committing each run keeps the template rotation going between runs, builds your
       # price history, and counts as repo activity (GitHub pauses schedules after 60 idle days).
+      # (debug/ is deliberately NOT added here, so snapshots never get committed.)
       - name: Save rotation state and price history
         if: always() # keep history + rotation even if one platform failed
         run: |
@@ -100,15 +141,18 @@ jobs:
           git pull --rebase --quiet || true  # in case you edited files on GitHub during the run
           git push
 
-      # esx.et sometimes refuses connections from some GitHub servers. If this run couldn't reach
-      # it (exit code 3, so nothing was posted), start the same job again on a fresh server with
-      # a new internet address. At most 3 attempts in total.
-      - name: Retry on a fresh server if esx.et was unreachable
-        if: failure() && steps.post.outputs.code == '3' && inputs.attempt != '3'
+      # esx.et sometimes refuses connections from some GitHub servers (exit code 3), and may
+      # also serve a different page to some of them (exit code 1: nonce not found). In both
+      # cases nothing was posted, so start the same job again on a fresh server with a new
+      # internet address. At most 3 attempts in total.
+      # If exit code 1 is caused by a real layout change, the retries will fail the same way
+      # and esx_bot.py itself must be fixed; remove the "== '1'" part to stop retrying then.
+      - name: Retry on a fresh server if esx.et was unreachable or served a bad page
+        if: failure() && (steps.post.outputs.code == '3' || steps.post.outputs.code == '1') && inputs.attempt != '3'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           next=$(( ${{ inputs.attempt || '1' }} + 1 ))
-          echo "esx.et was unreachable - starting attempt $next of 3 on a fresh server."
+          echo "esx.et was unreachable or returned an unexpected page - starting attempt $next of 3 on a fresh server."
           gh workflow run esx-post.yml --repo "${{ github.repository }}" --ref main \
             -f mode="${{ inputs.mode }}" -f attempt="$next"
