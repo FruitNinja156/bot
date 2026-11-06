@@ -31,13 +31,15 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
 
 BASE = "https://esx.et"
 AJAX = f"{BASE}/wp-admin/admin-ajax.php"
-HEADERS = {"User-Agent": "esx-personal-price-bot/0.1 (personal use)"}
+# Set ESX_USER_AGENT (e.g. in the workflow) to test whether esx.et treats the default agent differently.
+HEADERS = {"User-Agent": os.environ.get("ESX_USER_AGENT") or "esx-personal-price-bot/0.1 (personal use)"}
 
 # ---------------------------------------------------------------------------
 # >>> API KEY / BOT TOKEN GOES HERE <<<
@@ -74,6 +76,67 @@ NONCE_PATTERNS = [
     re.compile(r"esx_get_ticker[\s\S]{0,800}?nonce['\"]?\s*[:=]\s*['\"]([a-f0-9]+)['\"]", re.I),
     re.compile(r"nonce['\"]?\s*[:=]\s*['\"]([a-f0-9]+)['\"][\s\S]{0,800}?esx_get_ticker", re.I),
 ]
+
+
+# Fallback (used only if the two patterns above find nothing): any nonce-looking value, wherever it
+# lives - inline script, data-nonce="..." attribute, JSON-escaped (\"nonce\":\"...\") - each one is
+# then TESTED against the ticker endpoint, so a wrong guess costs one request, not a wrong post.
+NONCE_ANY_RE = re.compile(
+    r"""[\\]?['"]?([\w-]*nonce[\w-]*)[\\]?['"]?\s*[:=]\s*[\\]?['"]([A-Za-z0-9]{6,20})[\\]?['"]""",
+    re.I,
+)
+SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
+MAX_NONCE_TRIES = 8   # at most this many candidate nonces are tested against the endpoint
+MAX_SCRIPTS = 10      # at most this many of esx.et's own script files are downloaded and searched
+DEBUG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug")
+
+
+def _nonce_candidates(text):
+    """Nonce-looking values in text, de-duplicated, those near the word 'ticker' first."""
+    anchors = [m.start() for m in re.finditer(r"ticker", text, re.I)]
+    found = []
+    for m in NONCE_ANY_RE.finditer(text):
+        near = any(abs(m.start() - a) < 1500 for a in anchors)
+        found.append((not near, m.start(), m.group(2)))
+    found.sort()
+    out = []
+    for _, _, val in found:
+        if val not in out:
+            out.append(val)
+    return out
+
+
+def _same_site_scripts(html):
+    """esx.et's own <script src=...> files (ticker-looking ones first), skipping jQuery/WP core."""
+    host = urlparse(BASE).netloc
+    urls = []
+    for src in SCRIPT_SRC_RE.findall(html):
+        u = urljoin(BASE + "/", src.replace("&#038;", "&").replace("&amp;", "&"))
+        if urlparse(u).netloc == host and not re.search(r"jquery|wp-includes|emoji", u, re.I) and u not in urls:
+            urls.append(u)
+    urls.sort(key=lambda u: not re.search(r"ticker|esx", u, re.I))
+    return urls
+
+
+def _debug_homepage(r):
+    """Say (in the log) and save (debug/homepage-bot.html) what the bot actually received."""
+    text = r.text
+    title = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+    print(f"[debug] GET {r.url} -> HTTP {r.status_code}, {len(text)} chars, "
+          f"content-type={r.headers.get('content-type')}, server={r.headers.get('server')}", file=sys.stderr)
+    print(f"[debug] page title: {title.group(1).strip()[:120] if title else '(none)'}", file=sys.stderr)
+    for word in ("esx_get_ticker", "nonce", "ticker"):
+        hits = list(re.finditer(word, text, re.I))
+        print(f"[debug] '{word}' appears {len(hits)} time(s) in the homepage", file=sys.stderr)
+        for m in hits[:3]:
+            snippet = text[max(0, m.start() - 80): m.end() + 120].replace("\n", " ")
+            print(f"[debug]   ...{snippet}...", file=sys.stderr)
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(DEBUG_DIR, "homepage-bot.html"), "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"[debug] couldn't save the homepage: {e}", file=sys.stderr)
 
 
 class ESXError(Exception):
@@ -113,15 +176,57 @@ class ESXClient:
                 time.sleep(RETRY_WAITS[i])
         raise ESXUnreachable(f"esx.et could not be reached after {len(RETRY_WAITS) + 1} tries ({last}).")
 
+    def _try_nonce(self, nonce):
+        """True if the ticker endpoint accepts this nonce (used only by the fallback search)."""
+        try:
+            r = self._request("POST", AJAX, data={"action": "esx_get_ticker", "nonce": nonce})
+            return r.status_code == 200 and bool(json.loads(r.text.strip()).get("success"))
+        except (ValueError, requests.RequestException):
+            return False
+
     def _refresh_nonce(self):
         r = self._request("GET", BASE + "/")
         r.raise_for_status()
-        for pat in NONCE_PATTERNS:
+        for pat in NONCE_PATTERNS:  # fast path: the layout this bot was written for
             m = pat.search(r.text)
             if m:
                 self._nonce = m.group(1)
                 return
-        raise ESXError("Couldn't find the ticker nonce on the homepage - the site layout may have changed.")
+
+        # Fallback: the inline ticker script isn't where it used to be. Collect nonce-looking values
+        # from the homepage, then from esx.et's own script files, and keep the first one the
+        # endpoint actually accepts.
+        print("Ticker nonce not in the usual place - searching the homepage and its scripts...", file=sys.stderr)
+        tried = set()
+
+        def first_working(text):
+            for nonce in _nonce_candidates(text):
+                if nonce in tried or len(tried) >= MAX_NONCE_TRIES:
+                    continue
+                tried.add(nonce)
+                if self._try_nonce(nonce):
+                    return nonce
+            return None
+
+        nonce = first_working(r.text)
+        if nonce is None:
+            for url in _same_site_scripts(r.text)[:MAX_SCRIPTS]:
+                try:
+                    js = self._request("GET", url)
+                except requests.RequestException:
+                    continue
+                if js.status_code == 200:
+                    nonce = first_working(js.text)
+                    if nonce:
+                        print(f"Found a working nonce in {url}", file=sys.stderr)
+                        break
+        if nonce:
+            self._nonce = nonce
+            return
+
+        _debug_homepage(r)
+        raise ESXError("Couldn't find a working ticker nonce on the homepage or its scripts - the site "
+                       "layout may have changed (see the [debug] lines above / debug/homepage-bot.html).")
 
     def get_prices(self):
         """Return a list of dicts: {symbol, price (float), change_pct (float)}."""
